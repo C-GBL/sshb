@@ -1,0 +1,15 @@
+[Unit]
+Description=SSH Buddy - Tamagotchi Terminal Pet Daemon
+Documentation=https://github.com/sshb/sshb
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sshb-daemon
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,882 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# sshb - SSH Buddy: A Tamagotchi Terminal Pet
+# ===========================================================================
+# A persistent virtual pet that lives in your terminal.
+# Take care of your buddy between sessions - feed it, play with it,
+# let it sleep, and keep it happy and healthy.
+# ===========================================================================
+
+set -euo pipefail
+
+SSHB_DIR="${HOME}/.sshb"
+STATE_FILE="${SSHB_DIR}/state"
+LOG_FILE="${SSHB_DIR}/sshb.log"
+LOCK_FILE="${SSHB_DIR}/sshb.lock"
+VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Color definitions
+# ---------------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ---------------------------------------------------------------------------
+# Ensure state directory exists
+# ---------------------------------------------------------------------------
+init_dir() {
+    mkdir -p "${SSHB_DIR}"
+}
+
+# ---------------------------------------------------------------------------
+# Default state values
+# ---------------------------------------------------------------------------
+default_state() {
+    cat <<'EOF'
+PET_NAME=Pixel
+PET_TYPE=cat
+HUNGER=80
+ENERGY=80
+HAPPINESS=80
+HEALTH=80
+AGE_DAYS=0
+BORN_EPOCH=0
+LAST_FED_EPOCH=0
+LAST_SLEPT_EPOCH=0
+LAST_PLAYED_EPOCH=0
+LAST_UPDATE_EPOCH=0
+IS_SLEEPING=0
+ALIVE=1
+MOOD=happy
+TOTAL_FEEDS=0
+TOTAL_PLAYS=0
+TOTAL_SLEEPS=0
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Load or initialize state
+# ---------------------------------------------------------------------------
+load_state() {
+    if [[ ! -f "${STATE_FILE}" ]]; then
+        init_dir
+        default_state > "${STATE_FILE}"
+        local now
+        now=$(date +%s)
+        sed -i "s/^BORN_EPOCH=.*/BORN_EPOCH=${now}/" "${STATE_FILE}"
+        sed -i "s/^LAST_FED_EPOCH=.*/LAST_FED_EPOCH=${now}/" "${STATE_FILE}"
+        sed -i "s/^LAST_SLEPT_EPOCH=.*/LAST_SLEPT_EPOCH=${now}/" "${STATE_FILE}"
+        sed -i "s/^LAST_PLAYED_EPOCH=.*/LAST_PLAYED_EPOCH=${now}/" "${STATE_FILE}"
+        sed -i "s/^LAST_UPDATE_EPOCH=.*/LAST_UPDATE_EPOCH=${now}/" "${STATE_FILE}"
+    fi
+    # shellcheck disable=SC1090
+    source "${STATE_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Save current state variables back to file
+# ---------------------------------------------------------------------------
+save_state() {
+    cat > "${STATE_FILE}" <<EOF
+PET_NAME=${PET_NAME}
+PET_TYPE=${PET_TYPE}
+HUNGER=${HUNGER}
+ENERGY=${ENERGY}
+HAPPINESS=${HAPPINESS}
+HEALTH=${HEALTH}
+AGE_DAYS=${AGE_DAYS}
+BORN_EPOCH=${BORN_EPOCH}
+LAST_FED_EPOCH=${LAST_FED_EPOCH}
+LAST_SLEPT_EPOCH=${LAST_SLEPT_EPOCH}
+LAST_PLAYED_EPOCH=${LAST_PLAYED_EPOCH}
+LAST_UPDATE_EPOCH=${LAST_UPDATE_EPOCH}
+IS_SLEEPING=${IS_SLEEPING}
+ALIVE=${ALIVE}
+MOOD=${MOOD}
+TOTAL_FEEDS=${TOTAL_FEEDS}
+TOTAL_PLAYS=${TOTAL_PLAYS}
+TOTAL_SLEEPS=${TOTAL_SLEEPS}
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Clamp a value between 0 and 100
+# ---------------------------------------------------------------------------
+clamp() {
+    local val=$1
+    if (( val < 0 )); then
+        echo 0
+    elif (( val > 100 )); then
+        echo 100
+    else
+        echo "${val}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Calculate derived health from other stats
+# ---------------------------------------------------------------------------
+calc_health() {
+    local h=$(( (HUNGER + ENERGY + HAPPINESS) / 3 ))
+    echo "${h}"
+}
+
+# ---------------------------------------------------------------------------
+# Determine mood based on stats
+# ---------------------------------------------------------------------------
+calc_mood() {
+    local avg=$(( (HUNGER + ENERGY + HAPPINESS) / 3 ))
+    if (( ALIVE == 0 )); then
+        echo "dead"
+    elif (( IS_SLEEPING == 1 )); then
+        echo "sleeping"
+    elif (( avg >= 80 )); then
+        echo "ecstatic"
+    elif (( avg >= 60 )); then
+        echo "happy"
+    elif (( avg >= 40 )); then
+        echo "okay"
+    elif (( avg >= 20 )); then
+        echo "sad"
+    else
+        echo "miserable"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Decay stats based on elapsed time (called by daemon and on load)
+# ---------------------------------------------------------------------------
+decay_stats() {
+    local now
+    now=$(date +%s)
+    local elapsed=$(( now - LAST_UPDATE_EPOCH ))
+
+    # Decay every 300 seconds (5 minutes) = 1 tick
+    local ticks=$(( elapsed / 300 ))
+
+    if (( ticks <= 0 )); then
+        return
+    fi
+
+    if (( ALIVE == 0 )); then
+        LAST_UPDATE_EPOCH=${now}
+        save_state
+        return
+    fi
+
+    # Hunger decays faster
+    local hunger_loss=$(( ticks * 3 ))
+    # Energy decays moderately (slower if sleeping)
+    local energy_loss
+    if (( IS_SLEEPING == 1 )); then
+        # Sleeping restores energy
+        local energy_gain=$(( ticks * 5 ))
+        ENERGY=$(clamp $(( ENERGY + energy_gain )))
+        # Check if fully rested - wake up
+        if (( ENERGY >= 100 )); then
+            IS_SLEEPING=0
+        fi
+        energy_loss=0
+    else
+        energy_loss=$(( ticks * 2 ))
+    fi
+    # Happiness decays slowly
+    local happy_loss=$(( ticks * 1 ))
+
+    HUNGER=$(clamp $(( HUNGER - hunger_loss )))
+    ENERGY=$(clamp $(( ENERGY - energy_loss )))
+    HAPPINESS=$(clamp $(( HAPPINESS - happy_loss )))
+    HEALTH=$(calc_health)
+
+    # Calculate age
+    AGE_DAYS=$(( (now - BORN_EPOCH) / 86400 ))
+
+    # Check if pet has perished from neglect
+    if (( HUNGER <= 0 && ENERGY <= 0 && HAPPINESS <= 0 )); then
+        ALIVE=0
+        MOOD="dead"
+    else
+        MOOD=$(calc_mood)
+    fi
+
+    LAST_UPDATE_EPOCH=${now}
+    save_state
+}
+
+# ---------------------------------------------------------------------------
+# ASCII Art - Cat Frames
+# ---------------------------------------------------------------------------
+
+ascii_cat_happy() {
+    echo -e "${CYAN}"
+    cat << 'CATEOF'
+    /\_/\
+   ( ^.^ )
+    > ~ <
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_ecstatic() {
+    echo -e "${GREEN}"
+    cat << 'CATEOF'
+    /\_/\
+   ( ^o^ )  ~*
+    > ~ <  *
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_okay() {
+    echo -e "${YELLOW}"
+    cat << 'CATEOF'
+    /\_/\
+   ( -.- )
+    > ~ <
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_sad() {
+    echo -e "${RED}"
+    cat << 'CATEOF'
+    /\_/\
+   ( T.T )
+    > ~ <
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_miserable() {
+    echo -e "${RED}"
+    cat << 'CATEOF'
+    /\_/\
+   ( ;_; )  .
+    >   <  .
+   /|   |\ .
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_sleeping() {
+    echo -e "${BLUE}"
+    cat << 'CATEOF'
+    /\_/\
+   ( -.- ) z
+    > ~ <   z
+   /|   |\   Z
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_eating() {
+    echo -e "${GREEN}"
+    cat << 'CATEOF'
+    /\_/\
+   ( ^.^ )
+    >w=w<
+   /|   |\  ~fish~
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_playing() {
+    echo -e "${MAGENTA}"
+    cat << 'CATEOF'
+    /\_/\     o
+   ( >w< )  /
+    > ~ < --
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_dead() {
+    echo -e "${DIM}"
+    cat << 'CATEOF'
+    /\_/\
+   ( x.x )
+    > - <
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Display the cat based on mood or action
+# ---------------------------------------------------------------------------
+show_cat() {
+    local display_mood="${1:-$MOOD}"
+    case "${display_mood}" in
+        ecstatic)  ascii_cat_ecstatic ;;
+        happy)     ascii_cat_happy ;;
+        okay)      ascii_cat_okay ;;
+        sad)       ascii_cat_sad ;;
+        miserable) ascii_cat_miserable ;;
+        sleeping)  ascii_cat_sleeping ;;
+        eating)    ascii_cat_eating ;;
+        playing)   ascii_cat_playing ;;
+        dead)      ascii_cat_dead ;;
+        *)         ascii_cat_happy ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Stat bar renderer
+# ---------------------------------------------------------------------------
+stat_bar() {
+    local label="$1"
+    local value="$2"
+    local max=100
+    local bar_width=20
+    local filled=$(( value * bar_width / max ))
+    local empty=$(( bar_width - filled ))
+
+    local color
+    if (( value >= 70 )); then
+        color="${GREEN}"
+    elif (( value >= 40 )); then
+        color="${YELLOW}"
+    else
+        color="${RED}"
+    fi
+
+    printf "  %-11s ${color}" "${label}:"
+    printf "["
+    for (( i=0; i<filled; i++ )); do printf "#"; done
+    for (( i=0; i<empty; i++ )); do printf "."; done
+    printf "] %3d%%${RESET}\n" "${value}"
+}
+
+# ---------------------------------------------------------------------------
+# Show full status panel
+# ---------------------------------------------------------------------------
+show_status() {
+    load_state
+    decay_stats
+
+    echo ""
+    echo -e "${BOLD}${WHITE}  ========= SSH Buddy =========${RESET}"
+    echo -e "  ${BOLD}Name:${RESET} ${PET_NAME}  ${DIM}(${PET_TYPE})${RESET}"
+    echo -e "  ${BOLD}Age:${RESET}  ${AGE_DAYS} day(s)"
+    echo -e "  ${BOLD}Mood:${RESET} ${MOOD}"
+    echo -e "${BOLD}${WHITE}  ==============================${RESET}"
+    echo ""
+
+    show_cat
+
+    stat_bar "Hunger" "${HUNGER}"
+    stat_bar "Energy" "${ENERGY}"
+    stat_bar "Happiness" "${HAPPINESS}"
+    stat_bar "Health" "${HEALTH}"
+
+    echo ""
+    echo -e "  ${DIM}Lifetime - Feeds: ${TOTAL_FEEDS} | Plays: ${TOTAL_PLAYS} | Naps: ${TOTAL_SLEEPS}${RESET}"
+    echo ""
+
+    if (( ALIVE == 0 )); then
+        echo -e "  ${RED}${BOLD}Your buddy has passed away from neglect...${RESET}"
+        echo -e "  ${DIM}Use 'sshb revive' to bring them back.${RESET}"
+        echo ""
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Animated action display
+# ---------------------------------------------------------------------------
+animate_action() {
+    local action="$1"
+    local frames=3
+    local delay=0.5
+
+    for (( f=0; f<frames; f++ )); do
+        clear
+        echo ""
+        echo -e "${BOLD}${WHITE}  === SSH Buddy - ${action} ===${RESET}"
+        echo ""
+        case "${action}" in
+            Feeding)
+                if (( f % 2 == 0 )); then
+                    ascii_cat_eating
+                else
+                    ascii_cat_happy
+                fi
+                ;;
+            Playing)
+                if (( f % 2 == 0 )); then
+                    ascii_cat_playing
+                else
+                    ascii_cat_ecstatic
+                fi
+                ;;
+            Sleeping)
+                ascii_cat_sleeping
+                local zs=""
+                for (( z=0; z<=f; z++ )); do zs="${zs}z"; done
+                echo -e "  ${BLUE}${zs}...${RESET}"
+                ;;
+        esac
+        sleep "${delay}"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Feed the pet
+# ---------------------------------------------------------------------------
+cmd_feed() {
+    load_state
+    decay_stats
+
+    if (( ALIVE == 0 )); then
+        echo -e "${RED}Your buddy is no longer with us. Use 'sshb revive' first.${RESET}"
+        return 1
+    fi
+
+    if (( IS_SLEEPING == 1 )); then
+        echo -e "${YELLOW}${PET_NAME} is sleeping. Let them rest or use 'sshb wake' first.${RESET}"
+        return 1
+    fi
+
+    if (( HUNGER >= 95 )); then
+        echo -e "${YELLOW}${PET_NAME} is already full! No need to feed right now.${RESET}"
+        show_cat "happy"
+        return 0
+    fi
+
+    animate_action "Feeding"
+
+    local gain=$(( RANDOM % 15 + 20 ))
+    HUNGER=$(clamp $(( HUNGER + gain )))
+    HAPPINESS=$(clamp $(( HAPPINESS + 5 )))
+    HEALTH=$(calc_health)
+    MOOD=$(calc_mood)
+    LAST_FED_EPOCH=$(date +%s)
+    TOTAL_FEEDS=$(( TOTAL_FEEDS + 1 ))
+    save_state
+
+    clear
+    echo ""
+    echo -e "${GREEN}${BOLD}  Yum! ${PET_NAME} enjoyed the meal! (+${gain} hunger)${RESET}"
+    echo ""
+    show_cat
+    stat_bar "Hunger" "${HUNGER}"
+    stat_bar "Happiness" "${HAPPINESS}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Play with the pet
+# ---------------------------------------------------------------------------
+cmd_play() {
+    load_state
+    decay_stats
+
+    if (( ALIVE == 0 )); then
+        echo -e "${RED}Your buddy is no longer with us. Use 'sshb revive' first.${RESET}"
+        return 1
+    fi
+
+    if (( IS_SLEEPING == 1 )); then
+        echo -e "${YELLOW}${PET_NAME} is sleeping. Let them rest or use 'sshb wake' first.${RESET}"
+        return 1
+    fi
+
+    if (( ENERGY < 10 )); then
+        echo -e "${YELLOW}${PET_NAME} is too tired to play. Try 'sshb sleep' first.${RESET}"
+        show_cat "sad"
+        return 1
+    fi
+
+    animate_action "Playing"
+
+    local gain=$(( RANDOM % 15 + 20 ))
+    HAPPINESS=$(clamp $(( HAPPINESS + gain )))
+    ENERGY=$(clamp $(( ENERGY - 10 )))
+    HUNGER=$(clamp $(( HUNGER - 5 )))
+    HEALTH=$(calc_health)
+    MOOD=$(calc_mood)
+    LAST_PLAYED_EPOCH=$(date +%s)
+    TOTAL_PLAYS=$(( TOTAL_PLAYS + 1 ))
+    save_state
+
+    clear
+    echo ""
+    echo -e "${MAGENTA}${BOLD}  ${PET_NAME} had a blast playing! (+${gain} happiness)${RESET}"
+    echo ""
+    show_cat
+    stat_bar "Happiness" "${HAPPINESS}"
+    stat_bar "Energy" "${ENERGY}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Put the pet to sleep
+# ---------------------------------------------------------------------------
+cmd_sleep() {
+    load_state
+    decay_stats
+
+    if (( ALIVE == 0 )); then
+        echo -e "${RED}Your buddy is no longer with us. Use 'sshb revive' first.${RESET}"
+        return 1
+    fi
+
+    if (( IS_SLEEPING == 1 )); then
+        echo -e "${BLUE}${PET_NAME} is already sleeping. Shhh...${RESET}"
+        show_cat "sleeping"
+        return 0
+    fi
+
+    if (( ENERGY >= 95 )); then
+        echo -e "${YELLOW}${PET_NAME} is wide awake and not tired at all!${RESET}"
+        show_cat "happy"
+        return 0
+    fi
+
+    animate_action "Sleeping"
+
+    IS_SLEEPING=1
+    MOOD="sleeping"
+    LAST_SLEPT_EPOCH=$(date +%s)
+    TOTAL_SLEEPS=$(( TOTAL_SLEEPS + 1 ))
+    save_state
+
+    clear
+    echo ""
+    echo -e "${BLUE}${BOLD}  ${PET_NAME} curled up and fell asleep. Sweet dreams!${RESET}"
+    echo ""
+    show_cat "sleeping"
+    stat_bar "Energy" "${ENERGY}"
+    echo ""
+    echo -e "  ${DIM}Energy will restore over time while sleeping.${RESET}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Wake the pet up
+# ---------------------------------------------------------------------------
+cmd_wake() {
+    load_state
+    decay_stats
+
+    if (( IS_SLEEPING == 0 )); then
+        echo -e "${YELLOW}${PET_NAME} is already awake!${RESET}"
+        return 0
+    fi
+
+    IS_SLEEPING=0
+    MOOD=$(calc_mood)
+    save_state
+
+    echo ""
+    echo -e "${CYAN}${BOLD}  ${PET_NAME} woke up!${RESET}"
+    echo ""
+    show_cat
+    stat_bar "Energy" "${ENERGY}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Rename the pet
+# ---------------------------------------------------------------------------
+cmd_rename() {
+    local new_name="$1"
+    if [[ -z "${new_name}" ]]; then
+        echo -e "${YELLOW}Usage: sshb rename <new-name>${RESET}"
+        return 1
+    fi
+
+    # Sanitize - only allow alphanumeric, spaces, hyphens, underscores
+    new_name=$(echo "${new_name}" | tr -cd 'a-zA-Z0-9 _-')
+
+    if [[ -z "${new_name}" ]]; then
+        echo -e "${RED}Invalid name. Use letters, numbers, spaces, hyphens, or underscores.${RESET}"
+        return 1
+    fi
+
+    load_state
+    local old_name="${PET_NAME}"
+    PET_NAME="${new_name}"
+    save_state
+
+    echo -e "${GREEN}Renamed your buddy from '${old_name}' to '${PET_NAME}'!${RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Revive a dead pet (reset stats)
+# ---------------------------------------------------------------------------
+cmd_revive() {
+    load_state
+
+    if (( ALIVE == 1 )); then
+        echo -e "${YELLOW}${PET_NAME} is alive and well! No need to revive.${RESET}"
+        return 0
+    fi
+
+    HUNGER=50
+    ENERGY=50
+    HAPPINESS=50
+    HEALTH=50
+    ALIVE=1
+    IS_SLEEPING=0
+    MOOD="happy"
+    local now
+    now=$(date +%s)
+    LAST_FED_EPOCH=${now}
+    LAST_SLEPT_EPOCH=${now}
+    LAST_PLAYED_EPOCH=${now}
+    LAST_UPDATE_EPOCH=${now}
+    save_state
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  ${PET_NAME} has been revived! Welcome back, buddy!${RESET}"
+    echo ""
+    show_cat "happy"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Reset everything (new pet)
+# ---------------------------------------------------------------------------
+cmd_reset() {
+    echo -e "${YELLOW}This will completely reset your pet. Are you sure? (y/n)${RESET}"
+    read -r confirm
+    if [[ "${confirm}" == "y" || "${confirm}" == "Y" ]]; then
+        rm -f "${STATE_FILE}"
+        load_state
+        echo -e "${GREEN}New buddy created! Say hello to ${PET_NAME}!${RESET}"
+        show_cat "happy"
+    else
+        echo "Reset cancelled."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# One-line status for prompt integration
+# ---------------------------------------------------------------------------
+cmd_prompt() {
+    load_state
+    decay_stats
+
+    if (( ALIVE == 0 )); then
+        echo -e "[${PET_NAME}:x.x]"
+        return
+    fi
+
+    local icon
+    case "${MOOD}" in
+        ecstatic)  icon="^o^" ;;
+        happy)     icon="^.^" ;;
+        okay)      icon="-.-" ;;
+        sad)       icon="T.T" ;;
+        miserable) icon=";_;" ;;
+        sleeping)  icon="-_- z" ;;
+        *)         icon="..." ;;
+    esac
+
+    local avg=$(( (HUNGER + ENERGY + HAPPINESS) / 3 ))
+    local color
+    if (( avg >= 70 )); then
+        color="${GREEN}"
+    elif (( avg >= 40 )); then
+        color="${YELLOW}"
+    else
+        color="${RED}"
+    fi
+
+    echo -e "${color}[${PET_NAME}(${icon}) H:${HUNGER} E:${ENERGY} J:${HAPPINESS}]${RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Mini display - compact status for quick checks
+# ---------------------------------------------------------------------------
+cmd_mini() {
+    load_state
+    decay_stats
+
+    show_cat
+    echo -e "  ${BOLD}${PET_NAME}${RESET} - ${MOOD}"
+    echo -e "  H:${HUNGER}% E:${ENERGY}% J:${HAPPINESS}%"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Interactive mode
+# ---------------------------------------------------------------------------
+cmd_interactive() {
+    while true; do
+        clear
+        show_status
+
+        echo -e "  ${BOLD}Commands:${RESET}"
+        echo -e "    ${CYAN}f${RESET} - Feed    ${CYAN}p${RESET} - Play    ${CYAN}s${RESET} - Sleep"
+        echo -e "    ${CYAN}w${RESET} - Wake    ${CYAN}r${RESET} - Refresh ${CYAN}q${RESET} - Quit"
+        echo ""
+        echo -n "  > "
+        read -r -n 1 choice
+        echo ""
+
+        case "${choice}" in
+            f) cmd_feed ;;
+            p) cmd_play ;;
+            s) cmd_sleep ;;
+            w) cmd_wake ;;
+            r) continue ;;
+            q) clear; echo -e "${CYAN}See you later! ${PET_NAME} will be waiting.${RESET}"; break ;;
+            *) echo -e "${YELLOW}Unknown command.${RESET}"; sleep 1 ;;
+        esac
+
+        if [[ "${choice}" != "r" && "${choice}" != "q" ]]; then
+            echo ""
+            echo -e "  ${DIM}Press any key to continue...${RESET}"
+            read -r -n 1
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Show help
+# ---------------------------------------------------------------------------
+cmd_help() {
+    echo ""
+    echo -e "${BOLD}${WHITE}  sshb - SSH Buddy v${VERSION}${RESET}"
+    echo -e "${DIM}  A Tamagotchi pet for your terminal${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Usage:${RESET} sshb <command>"
+    echo ""
+    echo -e "  ${BOLD}Care Commands:${RESET}"
+    echo -e "    ${CYAN}feed${RESET}        Feed your buddy"
+    echo -e "    ${CYAN}play${RESET}        Play with your buddy"
+    echo -e "    ${CYAN}sleep${RESET}       Put your buddy to bed"
+    echo -e "    ${CYAN}wake${RESET}        Wake your buddy up"
+    echo ""
+    echo -e "  ${BOLD}Info Commands:${RESET}"
+    echo -e "    ${CYAN}status${RESET}      Show full status panel"
+    echo -e "    ${CYAN}mini${RESET}        Show compact status"
+    echo -e "    ${CYAN}prompt${RESET}      One-line status for bash prompt"
+    echo -e "    ${CYAN}interactive${RESET} Launch interactive mode"
+    echo ""
+    echo -e "  ${BOLD}Management:${RESET}"
+    echo -e "    ${CYAN}rename${RESET} <n>  Rename your buddy"
+    echo -e "    ${CYAN}revive${RESET}      Revive a dead buddy"
+    echo -e "    ${CYAN}reset${RESET}       Start over with a new buddy"
+    echo -e "    ${CYAN}install-prompt${RESET}  Add buddy to your bash prompt"
+    echo -e "    ${CYAN}uninstall-prompt${RESET}  Remove buddy from bash prompt"
+    echo -e "    ${CYAN}version${RESET}     Show version info"
+    echo -e "    ${CYAN}help${RESET}        Show this help message"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Install prompt integration
+# ---------------------------------------------------------------------------
+cmd_install_prompt() {
+    local bashrc="${HOME}/.bashrc"
+    local marker="# SSHB-PROMPT-INTEGRATION"
+
+    if grep -q "${marker}" "${bashrc}" 2>/dev/null; then
+        echo -e "${YELLOW}SSH Buddy prompt is already installed in your .bashrc${RESET}"
+        return 0
+    fi
+
+    cat >> "${bashrc}" << 'BASHEOF'
+
+# SSHB-PROMPT-INTEGRATION - SSH Buddy Tamagotchi prompt
+# This updates your prompt with your pet's status every time you hit Enter
+if command -v sshb &> /dev/null; then
+    __sshb_prompt() {
+        local sshb_status
+        sshb_status=$(sshb prompt 2>/dev/null)
+        if [[ -n "${sshb_status}" ]]; then
+            PS1="${sshb_status} \[\033[1;32m\]\u@\h\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]\$ "
+        else
+            PS1="\[\033[1;32m\]\u@\h\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]\$ "
+        fi
+    }
+    PROMPT_COMMAND="__sshb_prompt"
+fi
+# END-SSHB-PROMPT-INTEGRATION
+BASHEOF
+
+    echo -e "${GREEN}SSH Buddy prompt installed! Run 'source ~/.bashrc' or open a new terminal.${RESET}"
+    echo -e "${DIM}Your prompt will now show ${PET_NAME}'s status.${RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Uninstall prompt integration
+# ---------------------------------------------------------------------------
+cmd_uninstall_prompt() {
+    local bashrc="${HOME}/.bashrc"
+    local start_marker="# SSHB-PROMPT-INTEGRATION"
+    local end_marker="# END-SSHB-PROMPT-INTEGRATION"
+
+    if ! grep -q "${start_marker}" "${bashrc}" 2>/dev/null; then
+        echo -e "${YELLOW}SSH Buddy prompt is not installed in your .bashrc${RESET}"
+        return 0
+    fi
+
+    sed -i "/${start_marker}/,/${end_marker}/d" "${bashrc}"
+    echo -e "${GREEN}SSH Buddy prompt removed. Run 'source ~/.bashrc' or open a new terminal.${RESET}"
+}
+
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+cmd_version() {
+    echo -e "sshb v${VERSION}"
+}
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+main() {
+    init_dir
+    local cmd="${1:-}"
+    shift 2>/dev/null || true
+
+    case "${cmd}" in
+        feed)              cmd_feed ;;
+        play)              cmd_play ;;
+        sleep)             cmd_sleep ;;
+        wake)              cmd_wake ;;
+        status|"")         show_status ;;
+        mini)              cmd_mini ;;
+        prompt)            cmd_prompt ;;
+        interactive|i)     cmd_interactive ;;
+        rename)            cmd_rename "$*" ;;
+        revive)            cmd_revive ;;
+        reset)             cmd_reset ;;
+        install-prompt)    load_state; cmd_install_prompt ;;
+        uninstall-prompt)  cmd_uninstall_prompt ;;
+        version|-v)        cmd_version ;;
+        help|-h|--help)    cmd_help ;;
+        *)
+            echo -e "${RED}Unknown command: ${cmd}${RESET}"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

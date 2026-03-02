@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# sshb-daemon - Background stat decay service for SSH Buddy
+# ===========================================================================
+# This script runs as a systemd user service and decays pet stats
+# every 5 minutes to simulate the passage of time.
+# ===========================================================================
+
+set -euo pipefail
+
+SSHB_USER="${SSHB_USER:-$USER}"
+SSHB_DIR="${HOME}/.sshb"
+STATE_FILE="${SSHB_DIR}/state"
+LOG_FILE="${SSHB_DIR}/daemon.log"
+INTERVAL=300  # 5 minutes in seconds
+
+log_msg() {
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] $1" >> "${LOG_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Clamp a value between 0 and 100
+# ---------------------------------------------------------------------------
+clamp() {
+    local val=$1
+    if (( val < 0 )); then
+        echo 0
+    elif (( val > 100 )); then
+        echo 100
+    else
+        echo "${val}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main decay tick - called every INTERVAL seconds
+# ---------------------------------------------------------------------------
+decay_tick() {
+    if [[ ! -f "${STATE_FILE}" ]]; then
+        log_msg "No state file found, skipping tick."
+        return
+    fi
+
+    # shellcheck disable=SC1090
+    source "${STATE_FILE}"
+
+    if (( ALIVE == 0 )); then
+        log_msg "Pet is dead, skipping decay."
+        return
+    fi
+
+    local now
+    now=$(date +%s)
+
+    # Decay hunger
+    local hunger_loss=3
+    HUNGER=$(clamp $(( HUNGER - hunger_loss )))
+
+    # Energy handling
+    if (( IS_SLEEPING == 1 )); then
+        local energy_gain=5
+        ENERGY=$(clamp $(( ENERGY + energy_gain )))
+        if (( ENERGY >= 100 )); then
+            IS_SLEEPING=0
+            log_msg "Pet woke up naturally (fully rested)."
+        fi
+    else
+        local energy_loss=2
+        ENERGY=$(clamp $(( ENERGY - energy_loss )))
+    fi
+
+    # Decay happiness
+    local happy_loss=1
+    HAPPINESS=$(clamp $(( HAPPINESS - happy_loss )))
+
+    # Recalculate health
+    HEALTH=$(( (HUNGER + ENERGY + HAPPINESS) / 3 ))
+
+    # Calculate age
+    AGE_DAYS=$(( (now - BORN_EPOCH) / 86400 ))
+
+    # Check alive status
+    if (( HUNGER <= 0 && ENERGY <= 0 && HAPPINESS <= 0 )); then
+        ALIVE=0
+        MOOD="dead"
+        log_msg "Pet has died from neglect."
+    else
+        # Calculate mood
+        local avg=$(( (HUNGER + ENERGY + HAPPINESS) / 3 ))
+        if (( IS_SLEEPING == 1 )); then
+            MOOD="sleeping"
+        elif (( avg >= 80 )); then
+            MOOD="ecstatic"
+        elif (( avg >= 60 )); then
+            MOOD="happy"
+        elif (( avg >= 40 )); then
+            MOOD="okay"
+        elif (( avg >= 20 )); then
+            MOOD="sad"
+        else
+            MOOD="miserable"
+        fi
+    fi
+
+    LAST_UPDATE_EPOCH=${now}
+
+    # Write state atomically
+    local tmpfile="${STATE_FILE}.tmp"
+    cat > "${tmpfile}" <<EOF
+PET_NAME=${PET_NAME}
+PET_TYPE=${PET_TYPE}
+HUNGER=${HUNGER}
+ENERGY=${ENERGY}
+HAPPINESS=${HAPPINESS}
+HEALTH=${HEALTH}
+AGE_DAYS=${AGE_DAYS}
+BORN_EPOCH=${BORN_EPOCH}
+LAST_FED_EPOCH=${LAST_FED_EPOCH}
+LAST_SLEPT_EPOCH=${LAST_SLEPT_EPOCH}
+LAST_PLAYED_EPOCH=${LAST_PLAYED_EPOCH}
+LAST_UPDATE_EPOCH=${LAST_UPDATE_EPOCH}
+IS_SLEEPING=${IS_SLEEPING}
+ALIVE=${ALIVE}
+MOOD=${MOOD}
+TOTAL_FEEDS=${TOTAL_FEEDS}
+TOTAL_PLAYS=${TOTAL_PLAYS}
+TOTAL_SLEEPS=${TOTAL_SLEEPS}
+EOF
+    mv "${tmpfile}" "${STATE_FILE}"
+
+    log_msg "Tick complete - H:${HUNGER} E:${ENERGY} J:${HAPPINESS} HP:${HEALTH} Mood:${MOOD}"
+}
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+main() {
+    mkdir -p "${SSHB_DIR}"
+    log_msg "sshb-daemon started (PID: $$, interval: ${INTERVAL}s)"
+
+    trap 'log_msg "sshb-daemon stopping."; exit 0' SIGTERM SIGINT
+
+    while true; do
+        decay_tick
+        sleep "${INTERVAL}"
+    done
+}
+
+main "$@"
