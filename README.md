@@ -190,4 +190,4 @@ source ~/.bashrc
 
 ## License
 
-MIT
+GNU General Public License
