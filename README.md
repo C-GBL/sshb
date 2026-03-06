@@ -1,4 +1,4 @@
-![](https://github-view-counter.vercel.app/api?username=C-GBL=sshb&label=Views)
+![](https://github-view-counter.vercel.app/api?username=C-GBL=sshb&label=View)
 
 # sshb - SSH Buddy
 
