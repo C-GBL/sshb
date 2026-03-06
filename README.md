@@ -23,6 +23,15 @@ background service, so check in regularly or face the consequences.
 - Interactive mode for quick care sessions
 - Pet aging, mood system, and lifetime stat tracking
 
+## New Features
+- Added Blackjack
+- Adding quips about previous command state by hooking ```$?``` exit code, and the last command via history
+
+```
+  /\_/\
+ ( -w- )  Your branch is 47 commits behind and so is your understanding
+```
+
 ## Requirements
 
 - Ubuntu 18.04+ (or any systemd-based Linux distro)
