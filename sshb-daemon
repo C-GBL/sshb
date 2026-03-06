@@ -46,6 +46,13 @@ decay_tick() {
     # shellcheck disable=SC1090
     source "${STATE_FILE}"
 
+    # Migrate old state files that lack blackjack stats
+    if [[ -z "${BJ_WINS:-}" ]]; then
+        BJ_WINS=0
+        BJ_LOSSES=0
+        BJ_PUSHES=0
+    fi
+
     if (( ALIVE == 0 )); then
         log_msg "Pet is dead, skipping decay."
         return
@@ -127,6 +134,9 @@ MOOD=${MOOD}
 TOTAL_FEEDS=${TOTAL_FEEDS}
 TOTAL_PLAYS=${TOTAL_PLAYS}
 TOTAL_SLEEPS=${TOTAL_SLEEPS}
+BJ_WINS=${BJ_WINS}
+BJ_LOSSES=${BJ_LOSSES}
+BJ_PUSHES=${BJ_PUSHES}
 EOF
     mv "${tmpfile}" "${STATE_FILE}"
 

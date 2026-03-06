@@ -5,6 +5,8 @@
 # A persistent virtual pet that lives in your terminal.
 # Take care of your buddy between sessions - feed it, play with it,
 # let it sleep, and keep it happy and healthy.
+#
+# v2.0 - Now with blackjack and your cat roasts your failed commands.
 # ===========================================================================
 
 set -euo pipefail
@@ -13,7 +15,7 @@ SSHB_DIR="${HOME}/.sshb"
 STATE_FILE="${SSHB_DIR}/state"
 LOG_FILE="${SSHB_DIR}/sshb.log"
 LOCK_FILE="${SSHB_DIR}/sshb.lock"
-VERSION="1.0.0"
+VERSION="2.0.0"
 
 # ---------------------------------------------------------------------------
 # Color definitions
@@ -59,6 +61,9 @@ MOOD=happy
 TOTAL_FEEDS=0
 TOTAL_PLAYS=0
 TOTAL_SLEEPS=0
+BJ_WINS=0
+BJ_LOSSES=0
+BJ_PUSHES=0
 EOF
 }
 
@@ -77,6 +82,14 @@ load_state() {
         sed -i "s/^LAST_PLAYED_EPOCH=.*/LAST_PLAYED_EPOCH=${now}/" "${STATE_FILE}"
         sed -i "s/^LAST_UPDATE_EPOCH=.*/LAST_UPDATE_EPOCH=${now}/" "${STATE_FILE}"
     fi
+
+    # Migrate old state files that lack blackjack stats
+    if ! grep -q "^BJ_WINS=" "${STATE_FILE}" 2>/dev/null; then
+        echo "BJ_WINS=0" >> "${STATE_FILE}"
+        echo "BJ_LOSSES=0" >> "${STATE_FILE}"
+        echo "BJ_PUSHES=0" >> "${STATE_FILE}"
+    fi
+
     # shellcheck disable=SC1090
     source "${STATE_FILE}"
 }
@@ -104,6 +117,9 @@ MOOD=${MOOD}
 TOTAL_FEEDS=${TOTAL_FEEDS}
 TOTAL_PLAYS=${TOTAL_PLAYS}
 TOTAL_SLEEPS=${TOTAL_SLEEPS}
+BJ_WINS=${BJ_WINS}
+BJ_LOSSES=${BJ_LOSSES}
+BJ_PUSHES=${BJ_PUSHES}
 EOF
 }
 
@@ -211,9 +227,9 @@ decay_stats() {
     save_state
 }
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # ASCII Art - Cat Frames
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 ascii_cat_happy() {
     echo -e "${CYAN}"
@@ -323,22 +339,74 @@ CATEOF
     echo -e "${RESET}"
 }
 
+ascii_cat_smug() {
+    echo -e "${MAGENTA}"
+    cat << 'CATEOF'
+    /\_/\
+   ( -w- )
+    > ~ <
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_dealer() {
+    echo -e "${YELLOW}"
+    cat << 'CATEOF'
+    /\_/\
+   ( o.o ) ?
+    > ~ <
+   /| []|\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_laugh() {
+    echo -e "${MAGENTA}"
+    cat << 'CATEOF'
+    /\_/\
+   ( >D< ) ha!
+    > ~ <
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
+ascii_cat_impressed() {
+    echo -e "${GREEN}"
+    cat << 'CATEOF'
+    /\_/\
+   ( O.O )!
+    > ~ <
+   /|   |\
+  (_|   |_)
+CATEOF
+    echo -e "${RESET}"
+}
+
 # ---------------------------------------------------------------------------
 # Display the cat based on mood or action
 # ---------------------------------------------------------------------------
 show_cat() {
     local display_mood="${1:-$MOOD}"
     case "${display_mood}" in
-        ecstatic)  ascii_cat_ecstatic ;;
-        happy)     ascii_cat_happy ;;
-        okay)      ascii_cat_okay ;;
-        sad)       ascii_cat_sad ;;
-        miserable) ascii_cat_miserable ;;
-        sleeping)  ascii_cat_sleeping ;;
-        eating)    ascii_cat_eating ;;
-        playing)   ascii_cat_playing ;;
-        dead)      ascii_cat_dead ;;
-        *)         ascii_cat_happy ;;
+        ecstatic)   ascii_cat_ecstatic ;;
+        happy)      ascii_cat_happy ;;
+        okay)       ascii_cat_okay ;;
+        sad)        ascii_cat_sad ;;
+        miserable)  ascii_cat_miserable ;;
+        sleeping)   ascii_cat_sleeping ;;
+        eating)     ascii_cat_eating ;;
+        playing)    ascii_cat_playing ;;
+        dead)       ascii_cat_dead ;;
+        smug)       ascii_cat_smug ;;
+        dealer)     ascii_cat_dealer ;;
+        laugh)      ascii_cat_laugh ;;
+        impressed)  ascii_cat_impressed ;;
+        *)          ascii_cat_happy ;;
     esac
 }
 
@@ -393,6 +461,7 @@ show_status() {
 
     echo ""
     echo -e "  ${DIM}Lifetime - Feeds: ${TOTAL_FEEDS} | Plays: ${TOTAL_PLAYS} | Naps: ${TOTAL_SLEEPS}${RESET}"
+    echo -e "  ${DIM}Blackjack - W: ${BJ_WINS} | L: ${BJ_LOSSES} | Push: ${BJ_PUSHES}${RESET}"
     echo ""
 
     if (( ALIVE == 0 )); then
@@ -485,9 +554,274 @@ cmd_feed() {
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Play with the pet
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# BLACKJACK - Play a hand with your cat
+# ===========================================================================
+
+# Card values: 1-13 map to A,2,3,4,5,6,7,8,9,10,J,Q,K
+# Suits: 0=Spades, 1=Hearts, 2=Diamonds, 3=Clubs
+BJ_DECK=()
+BJ_PLAYER_HAND=()
+BJ_DEALER_HAND=()
+
+bj_card_name() {
+    local card=$1
+    local rank=$(( (card % 13) + 1 ))
+    local suit_num=$(( card / 13 ))
+    local rank_str suit_str
+
+    case ${rank} in
+        1)  rank_str="A" ;;
+        11) rank_str="J" ;;
+        12) rank_str="Q" ;;
+        13) rank_str="K" ;;
+        *)  rank_str="${rank}" ;;
+    esac
+
+    case ${suit_num} in
+        0) suit_str="s" ;;
+        1) suit_str="h" ;;
+        2) suit_str="d" ;;
+        3) suit_str="c" ;;
+    esac
+
+    echo "${rank_str}${suit_str}"
+}
+
+bj_card_value() {
+    local card=$1
+    local rank=$(( (card % 13) + 1 ))
+    if (( rank > 10 )); then
+        echo 10
+    else
+        echo "${rank}"
+    fi
+}
+
+bj_hand_value() {
+    local -n hand_ref=$1
+    local total=0
+    local aces=0
+    local val
+
+    for card in "${hand_ref[@]}"; do
+        val=$(bj_card_value "${card}")
+        if (( val == 1 )); then
+            aces=$(( aces + 1 ))
+            total=$(( total + 11 ))
+        else
+            total=$(( total + val ))
+        fi
+    done
+
+    # Downgrade aces from 11 to 1 if busting
+    while (( total > 21 && aces > 0 )); do
+        total=$(( total - 10 ))
+        aces=$(( aces - 1 ))
+    done
+
+    echo "${total}"
+}
+
+bj_shuffle() {
+    BJ_DECK=()
+    local i
+    for (( i=0; i<52; i++ )); do
+        BJ_DECK+=("${i}")
+    done
+    # Fisher-Yates shuffle
+    local n=${#BJ_DECK[@]}
+    for (( i=n-1; i>0; i-- )); do
+        local j=$(( RANDOM % (i + 1) ))
+        local tmp="${BJ_DECK[$i]}"
+        BJ_DECK[$i]="${BJ_DECK[$j]}"
+        BJ_DECK[$j]="${tmp}"
+    done
+}
+
+bj_draw() {
+    if (( ${#BJ_DECK[@]} == 0 )); then
+        bj_shuffle
+    fi
+    local card="${BJ_DECK[0]}"
+    BJ_DECK=("${BJ_DECK[@]:1}")
+    echo "${card}"
+}
+
+bj_render_card() {
+    local card=$1
+    local name
+    name=$(bj_card_name "${card}")
+    local rank="${name%?}"
+    local suit_char="${name: -1}"
+
+    local suit_sym
+    case "${suit_char}" in
+        s) suit_sym="S" ;;
+        h) suit_sym="H" ;;
+        d) suit_sym="D" ;;
+        c) suit_sym="C" ;;
+    esac
+
+    # Pad rank for alignment
+    if (( ${#rank} == 1 )); then
+        rank="${rank} "
+    fi
+
+    echo ".-----."
+    echo "|${rank}   |"
+    echo "|  ${suit_sym}  |"
+    echo "|   ${rank}|"
+    echo "'-----'"
+}
+
+bj_render_hidden() {
+    echo ".-----."
+    echo "|#####|"
+    echo "|#####|"
+    echo "|#####|"
+    echo "'-----'"
+}
+
+bj_show_table() {
+    local show_dealer_hole="${1:-no}"
+    local p_val d_val
+
+    p_val=$(bj_hand_value BJ_PLAYER_HAND)
+
+    echo ""
+    echo -e "${BOLD}${WHITE}  ========= BLACKJACK =========${RESET}"
+    echo ""
+
+    # Dealer hand
+    echo -e "  ${BOLD}Dealer's hand:${RESET}"
+    local first_card=1
+    local d_display_cards=()
+    for card in "${BJ_DEALER_HAND[@]}"; do
+        if (( first_card == 1 )) && [[ "${show_dealer_hole}" == "no" ]]; then
+            d_display_cards+=("hidden")
+        else
+            d_display_cards+=("${card}")
+        fi
+        first_card=0
+    done
+
+    # Render cards side by side (line by line)
+    local lines=()
+    for i in 0 1 2 3 4; do
+        lines[$i]="  "
+    done
+
+    for dc in "${d_display_cards[@]}"; do
+        local card_lines
+        if [[ "${dc}" == "hidden" ]]; then
+            card_lines=$(bj_render_hidden)
+        else
+            card_lines=$(bj_render_card "${dc}")
+        fi
+        local li=0
+        while IFS= read -r line; do
+            lines[$li]="${lines[$li]}${line} "
+            li=$(( li + 1 ))
+        done <<< "${card_lines}"
+    done
+
+    for line in "${lines[@]}"; do
+        echo "${line}"
+    done
+
+    if [[ "${show_dealer_hole}" == "yes" ]]; then
+        d_val=$(bj_hand_value BJ_DEALER_HAND)
+        echo -e "  ${DIM}Value: ${d_val}${RESET}"
+    else
+        # Show only the visible card value
+        local visible_val
+        visible_val=$(bj_card_value "${BJ_DEALER_HAND[1]}")
+        echo -e "  ${DIM}Showing: ${visible_val}${RESET}"
+    fi
+
+    echo ""
+
+    # Player hand
+    echo -e "  ${BOLD}Your hand:${RESET}"
+    local plines=()
+    for i in 0 1 2 3 4; do
+        plines[$i]="  "
+    done
+
+    for pc in "${BJ_PLAYER_HAND[@]}"; do
+        local card_lines
+        card_lines=$(bj_render_card "${pc}")
+        local li=0
+        while IFS= read -r line; do
+            plines[$li]="${plines[$li]}${line} "
+            li=$(( li + 1 ))
+        done <<< "${card_lines}"
+    done
+
+    for line in "${plines[@]}"; do
+        echo "${line}"
+    done
+
+    echo -e "  ${BOLD}Value: ${p_val}${RESET}"
+    echo ""
+}
+
+bj_taunt() {
+    local taunts=(
+        "I can see your cards, you know."
+        "Bold strategy. Let us see how it works out."
+        "My paws are crossed for you."
+        "I have seen better hands on a clock."
+        "You smell like someone who hits on 18."
+        "Interesting. Wrong, but interesting."
+        "The house always wins. And I am the house cat."
+        "I would not do that, but I am just a cat."
+        "Meow. That means 'you are going to lose' in cat."
+        "Are you sure? Blink twice if you need help."
+        "I learned counting cards. You clearly did not."
+        "Even my hairballs have better luck than you."
+    )
+    local idx=$(( RANDOM % ${#taunts[@]} ))
+    echo -e "  ${MAGENTA}${PET_NAME}: \"${taunts[$idx]}\"${RESET}"
+}
+
+bj_win_comment() {
+    local comments=(
+        "Fine. You win. I will remember this."
+        "Do not let it go to your head."
+        "Even a broken clock is right twice a day."
+        "Okay that was actually pretty good."
+        "Winner winner fish dinner. My fish dinner."
+        "You got lucky. The math was not in your favor."
+    )
+    local idx=$(( RANDOM % ${#comments[@]} ))
+    echo -e "  ${GREEN}${PET_NAME}: \"${comments[$idx]}\"${RESET}"
+}
+
+bj_lose_comment() {
+    local comments=(
+        "Ha! Better luck next time, human."
+        "I tried to warn you with my eyes."
+        "And they say cats are the ones with nine lives."
+        "Maybe stick to 'Hello World' programs."
+        "I am not mad. Just disappointed. Actually no, this is hilarious."
+        "You played that hand like you code -- recklessly."
+    )
+    local idx=$(( RANDOM % ${#comments[@]} ))
+    echo -e "  ${RED}${PET_NAME}: \"${comments[$idx]}\"${RESET}"
+}
+
+bj_push_comment() {
+    local comments=(
+        "A tie. How boring. Deal again."
+        "We both stink at this equally."
+        "Nobody wins. Just like arguments on the internet."
+    )
+    local idx=$(( RANDOM % ${#comments[@]} ))
+    echo -e "  ${YELLOW}${PET_NAME}: \"${comments[$idx]}\"${RESET}"
+}
+
 cmd_play() {
     load_state
     decay_stats
@@ -508,31 +842,385 @@ cmd_play() {
         return 1
     fi
 
-    animate_action "Playing"
+    # -- Start a hand of Blackjack --
+    bj_shuffle
+    BJ_PLAYER_HAND=()
+    BJ_DEALER_HAND=()
 
-    local gain=$(( RANDOM % 15 + 20 ))
-    HAPPINESS=$(clamp $(( HAPPINESS + gain )))
-    ENERGY=$(clamp $(( ENERGY - 10 )))
+    # Deal two cards each
+    BJ_PLAYER_HAND+=("$(bj_draw)")
+    BJ_DEALER_HAND+=("$(bj_draw)")
+    BJ_PLAYER_HAND+=("$(bj_draw)")
+    BJ_DEALER_HAND+=("$(bj_draw)")
+
+    local p_val d_val
+    p_val=$(bj_hand_value BJ_PLAYER_HAND)
+
+    # Check natural blackjack
+    if (( p_val == 21 )); then
+        clear
+        ascii_cat_impressed
+        bj_show_table "yes"
+        echo -e "  ${GREEN}${BOLD}BLACKJACK! Natural 21!${RESET}"
+        echo ""
+        bj_win_comment
+        HAPPINESS=$(clamp $(( HAPPINESS + 30 )))
+        ENERGY=$(clamp $(( ENERGY - 5 )))
+        BJ_WINS=$(( BJ_WINS + 1 ))
+        TOTAL_PLAYS=$(( TOTAL_PLAYS + 1 ))
+        LAST_PLAYED_EPOCH=$(date +%s)
+        HEALTH=$(calc_health)
+        MOOD=$(calc_mood)
+        save_state
+        echo ""
+        return 0
+    fi
+
+    # Player turn
+    while true; do
+        clear
+        ascii_cat_dealer
+        bj_show_table "no"
+        bj_taunt
+        echo ""
+        echo -e "  ${BOLD}[h]${RESET} Hit   ${BOLD}[s]${RESET} Stand"
+        echo ""
+        echo -n "  > "
+        read -r -n 1 action
+        echo ""
+
+        case "${action}" in
+            h|H)
+                BJ_PLAYER_HAND+=("$(bj_draw)")
+                p_val=$(bj_hand_value BJ_PLAYER_HAND)
+                if (( p_val > 21 )); then
+                    clear
+                    ascii_cat_laugh
+                    bj_show_table "yes"
+                    echo -e "  ${RED}${BOLD}BUST! You went over 21!${RESET}"
+                    echo ""
+                    bj_lose_comment
+                    HAPPINESS=$(clamp $(( HAPPINESS + 5 )))
+                    ENERGY=$(clamp $(( ENERGY - 10 )))
+                    BJ_LOSSES=$(( BJ_LOSSES + 1 ))
+                    TOTAL_PLAYS=$(( TOTAL_PLAYS + 1 ))
+                    LAST_PLAYED_EPOCH=$(date +%s)
+                    HEALTH=$(calc_health)
+                    MOOD=$(calc_mood)
+                    save_state
+                    echo ""
+                    return 0
+                fi
+                ;;
+            s|S)
+                break
+                ;;
+            *)
+                echo -e "  ${YELLOW}Press h to hit or s to stand.${RESET}"
+                sleep 1
+                ;;
+        esac
+    done
+
+    # Dealer turn
+    d_val=$(bj_hand_value BJ_DEALER_HAND)
+    while (( d_val < 17 )); do
+        BJ_DEALER_HAND+=("$(bj_draw)")
+        d_val=$(bj_hand_value BJ_DEALER_HAND)
+    done
+
+    p_val=$(bj_hand_value BJ_PLAYER_HAND)
+    d_val=$(bj_hand_value BJ_DEALER_HAND)
+
+    clear
+    bj_show_table "yes"
+
+    # Determine winner
+    if (( d_val > 21 )); then
+        ascii_cat_impressed
+        echo -e "  ${GREEN}${BOLD}Dealer busts! You win!${RESET}"
+        echo ""
+        bj_win_comment
+        HAPPINESS=$(clamp $(( HAPPINESS + 25 )))
+        ENERGY=$(clamp $(( ENERGY - 5 )))
+        BJ_WINS=$(( BJ_WINS + 1 ))
+    elif (( p_val > d_val )); then
+        ascii_cat_smug
+        echo -e "  ${GREEN}${BOLD}You win! ${p_val} beats ${d_val}!${RESET}"
+        echo ""
+        bj_win_comment
+        HAPPINESS=$(clamp $(( HAPPINESS + 25 )))
+        ENERGY=$(clamp $(( ENERGY - 5 )))
+        BJ_WINS=$(( BJ_WINS + 1 ))
+    elif (( d_val > p_val )); then
+        ascii_cat_laugh
+        echo -e "  ${RED}${BOLD}Dealer wins! ${d_val} beats ${p_val}!${RESET}"
+        echo ""
+        bj_lose_comment
+        HAPPINESS=$(clamp $(( HAPPINESS + 5 )))
+        ENERGY=$(clamp $(( ENERGY - 10 )))
+        BJ_LOSSES=$(( BJ_LOSSES + 1 ))
+    else
+        ascii_cat_okay
+        echo -e "  ${YELLOW}${BOLD}Push! Both have ${p_val}.${RESET}"
+        echo ""
+        bj_push_comment
+        HAPPINESS=$(clamp $(( HAPPINESS + 10 )))
+        ENERGY=$(clamp $(( ENERGY - 5 )))
+        BJ_PUSHES=$(( BJ_PUSHES + 1 ))
+    fi
+
+    TOTAL_PLAYS=$(( TOTAL_PLAYS + 1 ))
+    LAST_PLAYED_EPOCH=$(date +%s)
     HUNGER=$(clamp $(( HUNGER - 5 )))
     HEALTH=$(calc_health)
     MOOD=$(calc_mood)
-    LAST_PLAYED_EPOCH=$(date +%s)
-    TOTAL_PLAYS=$(( TOTAL_PLAYS + 1 ))
     save_state
-
-    clear
-    echo ""
-    echo -e "${MAGENTA}${BOLD}  ${PET_NAME} had a blast playing! (+${gain} happiness)${RESET}"
-    echo ""
-    show_cat
-    stat_bar "Happiness" "${HAPPINESS}"
-    stat_bar "Energy" "${ENERGY}"
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Put the pet to sleep
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# COMMAND REACTIONS - Roast failures, praise successes
+# ===========================================================================
+
+# Roasts for specific commands that failed
+roast_make() {
+    local r=(
+        "Segmentation fault in your brain too?"
+        "make: *** [your_career] Error 1"
+        "The only thing you are making is mistakes."
+        "Have you tried mass deleting everything and starting over?"
+        "Even I could write a better Makefile and I do not have thumbs."
+        "Maybe the code would compile if you believed in it harder."
+        "Ah yes, the classic 'it works on my machine' moment. Except it does not."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_docker() {
+    local r=(
+        "Your container is not the only thing that exited unexpectedly."
+        "docker: Error response from reality: you are not good at this."
+        "Have you tried containerizing your disappointment?"
+        "Layer 1 of 47 failed. Just like your first 47 attempts."
+        "The image is broken, kind of like your debugging process."
+        "Even a whale could not carry this build."
+        "Dockerfile, more like Dontfile."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_git() {
+    local r=(
+        "git: 'good' is not a git command. Neither is your workflow."
+        "Your branch is 47 commits behind and so is your understanding."
+        "Maybe try git gud."
+        "Merge conflict between your code and reality."
+        "Rejected. Just like that pull request."
+        "Have you considered git reset --hard on your career choices?"
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_npm() {
+    local r=(
+        "node_modules is heavier than your imposter syndrome."
+        "npm ERR! 404 Talent Not Found."
+        "Maybe try deleting node_modules again. Seventh time is the charm."
+        "Your dependencies have dependencies that have issues. Like you."
+        "npm audit found 847 vulnerabilities. And one bad developer."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_pip() {
+    local r=(
+        "pip install skill -- ERROR: No matching distribution found."
+        "Have you tried turning your virtualenv off and on again?"
+        "Your Python is more broken than a two-legged snake."
+        "ModuleNotFoundError: No module named 'competence'."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_ssh() {
+    local r=(
+        "Connection refused. Even the server does not want to talk to you."
+        "Permission denied. Story of your life."
+        "The remote host has better things to do."
+        "Port 22 closed, like this conversation."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_python() {
+    local r=(
+        "IndentationError: your code is as messy as your desk."
+        "SyntaxError: you forgot how to type again."
+        "Traceback: your entire decision to write Python today."
+        "NameError: 'success' is not defined in your session."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_cargo() {
+    local r=(
+        "Even the borrow checker gave up on you."
+        "error[E0308]: expected success, found skill issue."
+        "Rust says your lifetime has expired on this one."
+        "The compiler has more patience than I do. And it just ran out."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+roast_generic() {
+    local r=(
+        "Wow. Even I felt that one and I am a cat."
+        "Have you tried hiring someone to type for you?"
+        "I have seen better output from /dev/urandom."
+        "That command failed harder than my last jump off the counter."
+        "My litter box has a higher success rate than you today."
+        "Error? More like era. The era of things not working."
+        "I would help but I am busy licking my paws."
+        "404: Your talent was not found."
+        "You type with such confidence for someone who is so wrong."
+        "Maybe computers are just not your thing."
+        "The audacity. The sheer audacity of that command."
+        "Was that supposed to work? Genuine question."
+        "I have nine lives and I still would not waste one on that command."
+        "Task failed successfully. Oh wait. Just failed."
+        "If at first you do not succeed, try something completely different."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+# Praise lines for successful commands
+praise_make() {
+    local r=(
+        "It compiled? I am genuinely shocked."
+        "Build successful. Mark this day on the calendar."
+        "make: success. I did not think you had it in you."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+praise_docker() {
+    local r=(
+        "Container is up. The whale would be proud."
+        "Build complete. I will allow it."
+        "Docker actually worked? Who are you and what have you done with my human?"
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+praise_git() {
+    local r=(
+        "Clean push. I will pretend I am impressed."
+        "Committed. Unlike your other relationships."
+        "git: success. Even a blind cat catches a mouse sometimes."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+praise_generic() {
+    local r=(
+        "Nice. Even a broken clock, you know?"
+        "Hey, that actually worked. Good for you."
+        "Look at you, using a computer and everything."
+        "Success! I am purring. On the inside."
+        "Not bad for a human with no whiskers."
+        "Okay that was smooth. Do not get used to it."
+        "It worked! Quick, nobody touch anything."
+        "I knew you could do it. I am lying but still."
+        "Your keyboard should be proud right now."
+        "Clean run! I will give you a slow blink for that."
+    )
+    echo "${r[$(( RANDOM % ${#r[@]} ))]}"
+}
+
+# Pick which roast pool to use based on command name
+pick_roast() {
+    local cmd_name="$1"
+    case "${cmd_name}" in
+        make|cmake|ninja|gcc|g++|cc|clang)  roast_make ;;
+        docker|docker-compose|podman)        roast_docker ;;
+        git)                                  roast_git ;;
+        npm|npx|yarn|pnpm|bun)              roast_npm ;;
+        pip|pip3|pipenv|poetry)              roast_pip ;;
+        ssh|scp|sftp|rsync)                  roast_ssh ;;
+        python|python3)                       roast_python ;;
+        cargo|rustc)                          roast_cargo ;;
+        *)                                    roast_generic ;;
+    esac
+}
+
+pick_praise() {
+    local cmd_name="$1"
+    case "${cmd_name}" in
+        make|cmake|ninja|gcc|g++|cc|clang)  praise_make ;;
+        docker|docker-compose|podman)        praise_docker ;;
+        git)                                  praise_git ;;
+        *)                                    praise_generic ;;
+    esac
+}
+
+# Commands that are too boring/frequent to react to
+is_boring_command() {
+    local cmd_name="$1"
+    case "${cmd_name}" in
+        ls|cd|pwd|echo|cat|clear|history|exit|source|export|alias|unalias)
+            return 0 ;;
+        fg|bg|jobs|type|which|whoami|id|true|false|test|"[")
+            return 0 ;;
+        sshb|__sshb*)
+            return 0 ;;
+        ""|" ")
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Main react handler - called from PROMPT_COMMAND
+cmd_react() {
+    local exit_code="${1:-0}"
+    local cmd_name="${2:-}"
+
+    # Strip leading whitespace and get first word only
+    cmd_name=$(echo "${cmd_name}" | sed 's/^[[:space:]]*//' | awk '{print $1}')
+
+    # Skip boring commands
+    if is_boring_command "${cmd_name}"; then
+        return 0
+    fi
+
+    # Only react sometimes (30% chance for success, 60% chance for failure)
+    local roll=$(( RANDOM % 100 ))
+
+    if (( exit_code != 0 )); then
+        # Failed command - higher chance to roast
+        if (( roll < 60 )); then
+            local roast
+            roast=$(pick_roast "${cmd_name}")
+            echo -e "${MAGENTA}  /\\_/\\\\${RESET}"
+            echo -e "${MAGENTA} ( -w- )${RESET}  ${DIM}${roast}${RESET}"
+        fi
+    else
+        # Successful command - lower chance to praise
+        if (( roll < 30 )); then
+            local praise
+            praise=$(pick_praise "${cmd_name}")
+            echo -e "${CYAN}  /\\_/\\\\${RESET}"
+            echo -e "${CYAN} ( ^.^ )${RESET}  ${DIM}${praise}${RESET}"
+        fi
+    fi
+}
+
+
+# ===========================================================================
+# Original care commands (sleep, wake, etc.)
+# ===========================================================================
+
 cmd_sleep() {
     load_state
     decay_stats
@@ -573,9 +1261,6 @@ cmd_sleep() {
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Wake the pet up
-# ---------------------------------------------------------------------------
 cmd_wake() {
     load_state
     decay_stats
@@ -597,9 +1282,6 @@ cmd_wake() {
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Rename the pet
-# ---------------------------------------------------------------------------
 cmd_rename() {
     local new_name="$1"
     if [[ -z "${new_name}" ]]; then
@@ -607,7 +1289,6 @@ cmd_rename() {
         return 1
     fi
 
-    # Sanitize - only allow alphanumeric, spaces, hyphens, underscores
     new_name=$(echo "${new_name}" | tr -cd 'a-zA-Z0-9 _-')
 
     if [[ -z "${new_name}" ]]; then
@@ -623,9 +1304,6 @@ cmd_rename() {
     echo -e "${GREEN}Renamed your buddy from '${old_name}' to '${PET_NAME}'!${RESET}"
 }
 
-# ---------------------------------------------------------------------------
-# Revive a dead pet (reset stats)
-# ---------------------------------------------------------------------------
 cmd_revive() {
     load_state
 
@@ -656,9 +1334,6 @@ cmd_revive() {
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Reset everything (new pet)
-# ---------------------------------------------------------------------------
 cmd_reset() {
     echo -e "${YELLOW}This will completely reset your pet. Are you sure? (y/n)${RESET}"
     read -r confirm
@@ -672,9 +1347,6 @@ cmd_reset() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# One-line status for prompt integration
-# ---------------------------------------------------------------------------
 cmd_prompt() {
     load_state
     decay_stats
@@ -708,9 +1380,6 @@ cmd_prompt() {
     echo -e "${color}[${PET_NAME}(${icon}) H:${HUNGER} E:${ENERGY} J:${HAPPINESS}]${RESET}"
 }
 
-# ---------------------------------------------------------------------------
-# Mini display - compact status for quick checks
-# ---------------------------------------------------------------------------
 cmd_mini() {
     load_state
     decay_stats
@@ -721,17 +1390,14 @@ cmd_mini() {
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Interactive mode
-# ---------------------------------------------------------------------------
 cmd_interactive() {
     while true; do
         clear
         show_status
 
         echo -e "  ${BOLD}Commands:${RESET}"
-        echo -e "    ${CYAN}f${RESET} - Feed    ${CYAN}p${RESET} - Play    ${CYAN}s${RESET} - Sleep"
-        echo -e "    ${CYAN}w${RESET} - Wake    ${CYAN}r${RESET} - Refresh ${CYAN}q${RESET} - Quit"
+        echo -e "    ${CYAN}f${RESET} - Feed       ${CYAN}p${RESET} - Blackjack  ${CYAN}s${RESET} - Sleep"
+        echo -e "    ${CYAN}w${RESET} - Wake       ${CYAN}r${RESET} - Refresh    ${CYAN}q${RESET} - Quit"
         echo ""
         echo -n "  > "
         read -r -n 1 choice
@@ -755,9 +1421,6 @@ cmd_interactive() {
     done
 }
 
-# ---------------------------------------------------------------------------
-# Show help
-# ---------------------------------------------------------------------------
 cmd_help() {
     echo ""
     echo -e "${BOLD}${WHITE}  sshb - SSH Buddy v${VERSION}${RESET}"
@@ -766,31 +1429,33 @@ cmd_help() {
     echo -e "  ${BOLD}Usage:${RESET} sshb <command>"
     echo ""
     echo -e "  ${BOLD}Care Commands:${RESET}"
-    echo -e "    ${CYAN}feed${RESET}        Feed your buddy"
-    echo -e "    ${CYAN}play${RESET}        Play with your buddy"
-    echo -e "    ${CYAN}sleep${RESET}       Put your buddy to bed"
-    echo -e "    ${CYAN}wake${RESET}        Wake your buddy up"
+    echo -e "    ${CYAN}feed${RESET}         Feed your buddy"
+    echo -e "    ${CYAN}play${RESET}         Play blackjack with your buddy"
+    echo -e "    ${CYAN}sleep${RESET}        Put your buddy to bed"
+    echo -e "    ${CYAN}wake${RESET}         Wake your buddy up"
     echo ""
     echo -e "  ${BOLD}Info Commands:${RESET}"
-    echo -e "    ${CYAN}status${RESET}      Show full status panel"
-    echo -e "    ${CYAN}mini${RESET}        Show compact status"
-    echo -e "    ${CYAN}prompt${RESET}      One-line status for bash prompt"
-    echo -e "    ${CYAN}interactive${RESET} Launch interactive mode"
+    echo -e "    ${CYAN}status${RESET}       Show full status panel"
+    echo -e "    ${CYAN}mini${RESET}         Show compact status"
+    echo -e "    ${CYAN}prompt${RESET}       One-line status for bash prompt"
+    echo -e "    ${CYAN}interactive${RESET}  Launch interactive mode"
     echo ""
     echo -e "  ${BOLD}Management:${RESET}"
-    echo -e "    ${CYAN}rename${RESET} <n>  Rename your buddy"
-    echo -e "    ${CYAN}revive${RESET}      Revive a dead buddy"
-    echo -e "    ${CYAN}reset${RESET}       Start over with a new buddy"
-    echo -e "    ${CYAN}install-prompt${RESET}  Add buddy to your bash prompt"
+    echo -e "    ${CYAN}rename${RESET} <n>   Rename your buddy"
+    echo -e "    ${CYAN}revive${RESET}       Revive a dead buddy"
+    echo -e "    ${CYAN}reset${RESET}        Start over with a new buddy"
+    echo -e "    ${CYAN}install-prompt${RESET}    Add buddy to your bash prompt"
     echo -e "    ${CYAN}uninstall-prompt${RESET}  Remove buddy from bash prompt"
-    echo -e "    ${CYAN}version${RESET}     Show version info"
-    echo -e "    ${CYAN}help${RESET}        Show this help message"
+    echo -e "    ${CYAN}version${RESET}      Show version info"
+    echo -e "    ${CYAN}help${RESET}         Show this help message"
+    echo ""
+    echo -e "  ${BOLD}Reactions:${RESET}"
+    echo -e "    When prompt integration is active, your buddy will react to"
+    echo -e "    your commands - roasting failures and praising successes."
+    echo -e "    Knows: make, docker, git, npm, pip, ssh, python, cargo"
     echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Install prompt integration
-# ---------------------------------------------------------------------------
 cmd_install_prompt() {
     local bashrc="${HOME}/.bashrc"
     local marker="# SSHB-PROMPT-INTEGRATION"
@@ -803,9 +1468,17 @@ cmd_install_prompt() {
     cat >> "${bashrc}" << 'BASHEOF'
 
 # SSHB-PROMPT-INTEGRATION - SSH Buddy Tamagotchi prompt
-# This updates your prompt with your pet's status every time you hit Enter
+# Shows pet status in prompt and reacts to command success/failure
 if command -v sshb &> /dev/null; then
+    __sshb_last_exit=0
     __sshb_prompt() {
+        __sshb_last_exit=$?
+        local last_cmd
+        last_cmd=$(HISTTIMEFORMAT= history 1 | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//')
+        # Show reaction to previous command (if any)
+        if [[ -n "${last_cmd}" ]]; then
+            sshb react "${__sshb_last_exit}" "${last_cmd}" 2>/dev/null
+        fi
         local sshb_status
         sshb_status=$(sshb prompt 2>/dev/null)
         if [[ -n "${sshb_status}" ]]; then
@@ -820,12 +1493,9 @@ fi
 BASHEOF
 
     echo -e "${GREEN}SSH Buddy prompt installed! Run 'source ~/.bashrc' or open a new terminal.${RESET}"
-    echo -e "${DIM}Your prompt will now show ${PET_NAME}'s status.${RESET}"
+    echo -e "${DIM}Your prompt will now show ${PET_NAME}'s status and reactions.${RESET}"
 }
 
-# ---------------------------------------------------------------------------
-# Uninstall prompt integration
-# ---------------------------------------------------------------------------
 cmd_uninstall_prompt() {
     local bashrc="${HOME}/.bashrc"
     local start_marker="# SSHB-PROMPT-INTEGRATION"
@@ -840,9 +1510,6 @@ cmd_uninstall_prompt() {
     echo -e "${GREEN}SSH Buddy prompt removed. Run 'source ~/.bashrc' or open a new terminal.${RESET}"
 }
 
-# ---------------------------------------------------------------------------
-# Version
-# ---------------------------------------------------------------------------
 cmd_version() {
     echo -e "sshb v${VERSION}"
 }
@@ -863,6 +1530,7 @@ main() {
         status|"")         show_status ;;
         mini)              cmd_mini ;;
         prompt)            cmd_prompt ;;
+        react)             cmd_react "$@" ;;
         interactive|i)     cmd_interactive ;;
         rename)            cmd_rename "$*" ;;
         revive)            cmd_revive ;;

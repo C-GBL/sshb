@@ -30,33 +30,28 @@ fi
 
 echo ""
 
-# Stop and disable service
 echo -e "${GREEN}[1/5]${RESET} Stopping daemon service..."
 if command -v systemctl &> /dev/null; then
     systemctl --user stop sshb.service 2>/dev/null || true
     systemctl --user disable sshb.service 2>/dev/null || true
 fi
 
-# Remove service file
 echo -e "${GREEN}[2/5]${RESET} Removing service file..."
 rm -f "${SYSTEMD_DIR}/sshb.service"
 if command -v systemctl &> /dev/null; then
     systemctl --user daemon-reload 2>/dev/null || true
 fi
 
-# Remove binaries
 echo -e "${GREEN}[3/5]${RESET} Removing binaries..."
 rm -f "${INSTALL_DIR}/sshb"
 rm -f "${INSTALL_DIR}/sshb-daemon"
 
-# Remove prompt integration from bashrc
 echo -e "${GREEN}[4/5]${RESET} Cleaning up .bashrc..."
 if grep -q "SSHB-PROMPT-INTEGRATION" "${HOME}/.bashrc" 2>/dev/null; then
     sed -i '/# SSHB-PROMPT-INTEGRATION/,/# END-SSHB-PROMPT-INTEGRATION/d' "${HOME}/.bashrc"
     echo -e "  ${GREEN}Removed prompt integration from .bashrc${RESET}"
 fi
 
-# Remove pet data
 echo -e "${GREEN}[5/5]${RESET} Removing pet data..."
 echo -n "  Delete all pet data in ${SSHB_DIR}? (y/n): "
 read -r confirm_data
