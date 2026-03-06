@@ -196,7 +196,10 @@ source ~/.bashrc
 - If you forget, your buddy's stats will decay while you are away
 - The interactive mode (sshb i) is the fastest way to do multiple actions
 - Name your buddy something fun with `sshb rename MrWhiskers`
-
+``` 
+    /\_/\  Help out my owner so he can feed me!
+   ( ^.^ ) https://ko-fi.com/coryg58
+```
 ## License
 
 MIT
